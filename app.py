@@ -1,5 +1,4 @@
-import re
-from io import BytesIO
+import io
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -9,395 +8,437 @@ import streamlit as st
 
 st.set_page_config(page_title="EnergyCAP AP Risk Dashboard", layout="wide")
 
-# -----------------------------
+# -------------------------
 # Helpers
-# -----------------------------
+# -------------------------
 
-def clean_col(x: object) -> str:
-    if pd.isna(x):
-        return ""
-    s = str(x).strip().replace("\n", " ")
-    s = re.sub(r"\s+", " ", s)
-    return s
+def clean_col(c: object) -> str:
+    return " ".join(str(c).strip().replace("\n", " ").split())
 
 
-def norm_key(s: object) -> str:
-    s = clean_col(s).lower()
-    s = re.sub(r"[^a-z0-9]+", "", s)
-    return s
-
-CANONICAL_ALIASES: Dict[str, List[str]] = {
-    "place_code": ["placecode", "place", "sitecode", "siteid", "facilitycode"],
-    "place_name": ["placename", "sitename", "facilityname"],
-    "meter_code": ["metercode", "meter", "meterid", "meternumber"],
-    "commodity_code": ["commoditycode", "commodity", "service", "servicetype"],
-    "account_code": ["accountcode", "account", "accountnumber", "utilityaccount", "acctnumber", "acctno"],
-    "vendor_code": ["vendorcode", "vendor", "utilityvendor", "utility", "supplier"],
-    "vendor_name": ["vendorname", "utilityname", "suppliername"],
-    "bill_id": ["billid", "energycapbillid", "billnumber", "invoiceid", "invoicenumber"],
-    "billing_period": ["billingperiod", "billperiod", "period", "accountingperiod"],
-    "rate_schedule": ["rateschedule", "rate", "tariff"],
-    "start_date": ["startdate", "servicestart", "fromdate", "begindate"],
-    "end_date": ["enddate", "serviceend", "todate"],
-    "days": ["days", "billingdays", "servicedays"],
-    "native_use": ["nativeuse", "use", "usage", "consumption"],
-    "demand": ["demand", "kw", "billingdemand"],
-    "cost": ["cost", "currentcharges", "billamount", "invoiceamount", "totalcost"],
-    "prior_balance": ["priorbalance", "previousbalance", "balanceforward", "pastdue", "pastduebalance"],
-    "late_fee": ["latefee", "latecharge", "penalty", "financecharge"],
-    "amount_due": ["amountdueecbc", "amountdue", "totalamountdue", "netamountdue"],
-    "pay_amount": ["payamount", "paymentamount", "amountpaid", "payment"],
-    "ap_status": ["apstatus", "apstatusyesno", "exportedtoap", "senttoap", "appaymentstatus"],
-    "ap_date": ["apdate", "apexportdate", "paymentdate", "datepaid", "senttoapdate"],
-    "due_date": ["duedate", "paymentduedate", "billduedate"],
-    "entry_date": ["billentrydate", "entrydate", "importdate", "createddate"],
-}
-
-KNOWN_HEADER_KEYS = {v for vals in CANONICAL_ALIASES.values() for v in vals}
+def norm_col(c: object) -> str:
+    s = clean_col(c).lower()
+    keep = []
+    for ch in s:
+        keep.append(ch if ch.isalnum() else "_")
+    return "_".join("".join(keep).split("_"))
 
 
-def detect_header_row(raw: pd.DataFrame, max_scan: int = 30) -> int:
-    best_idx, best_score = 0, -1
+def find_header_row(raw: pd.DataFrame, required_tokens: List[str], max_scan: int = 20) -> int:
+    best_row = 0
+    best_score = -1
+    tokens = [t.lower() for t in required_tokens]
     for i in range(min(max_scan, len(raw))):
-        keys = [norm_key(x) for x in raw.iloc[i].tolist()]
-        score = sum(1 for k in keys if k in KNOWN_HEADER_KEYS)
-        # Bonus for distinctive report fields
-        if "apstatus" in keys:
-            score += 4
-        if "priorbalance" in keys:
-            score += 3
-        if "latefee" in keys:
-            score += 3
+        vals = [clean_col(v).lower() for v in raw.iloc[i].tolist() if pd.notna(v)]
+        joined = " | ".join(vals)
+        score = sum(1 for t in tokens if t in joined)
         if score > best_score:
-            best_idx, best_score = i, score
-    return best_idx
+            best_score = score
+            best_row = i
+    return best_row
 
 
-def map_columns(columns: List[str]) -> Dict[str, str]:
-    normalized_to_original = {norm_key(c): c for c in columns if clean_col(c)}
-    mapping = {}
-    for canonical, aliases in CANONICAL_ALIASES.items():
-        for alias in aliases:
-            if alias in normalized_to_original:
-                mapping[canonical] = normalized_to_original[alias]
-                break
-    return mapping
-
-
-def read_one_excel(uploaded_file) -> pd.DataFrame:
-    raw = pd.read_excel(uploaded_file, header=None, dtype=object)
-    header_row = detect_header_row(raw)
-    df = pd.read_excel(uploaded_file, header=header_row, dtype=object)
-    df.columns = [clean_col(c) for c in df.columns]
-    df = df.loc[:, [c for c in df.columns if c and not c.lower().startswith("unnamed")]]
+def read_energycap_excel(file, kind: str) -> pd.DataFrame:
+    """Read EnergyCAP Excel with flexible header detection."""
+    xls = pd.ExcelFile(file)
+    sheet = "Sheet1" if "Sheet1" in xls.sheet_names else xls.sheet_names[0]
+    raw = pd.read_excel(file, sheet_name=sheet, header=None)
+    if kind == "bill":
+        header_row = find_header_row(raw, ["Account Code", "Bill ID", "AP Status", "Billing Period", "Vendor Code"])
+    else:
+        header_row = find_header_row(raw, ["Account Number", "Vendor Name", "Cost Center", "Export Flag", "Meter Code"])
+    headers = [clean_col(x) for x in raw.iloc[header_row].tolist()]
+    df = raw.iloc[header_row + 1 :].copy()
+    df.columns = headers
     df = df.dropna(how="all")
-    df["source_file"] = getattr(uploaded_file, "name", "uploaded_file")
+    df = df.loc[:, [c for c in df.columns if c and not str(c).lower().startswith("unnamed")]]
+    df.columns = [clean_col(c) for c in df.columns]
     return df
 
 
-def parse_money(series: pd.Series) -> pd.Series:
-    if series is None:
+def coalesce_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    nmap = {norm_col(c): c for c in df.columns}
+    for cand in candidates:
+        nc = norm_col(cand)
+        if nc in nmap:
+            return nmap[nc]
+    # fuzzy contains fallback
+    for cand in candidates:
+        nc = norm_col(cand)
+        for k, v in nmap.items():
+            if nc in k or k in nc:
+                return v
+    return None
+
+
+def to_num(s):
+    if s is None:
         return pd.Series(dtype=float)
-    cleaned = series.astype(str).str.replace(r"[$,()]", "", regex=True).str.strip()
-    cleaned = cleaned.replace({"": np.nan, "nan": np.nan, "None": np.nan})
-    return pd.to_numeric(cleaned, errors="coerce").fillna(0.0)
+    return pd.to_numeric(s.astype(str).str.replace("$", "", regex=False).str.replace(",", "", regex=False).replace({"nan": np.nan, "None": np.nan, "": np.nan}), errors="coerce")
 
 
-def parse_num(series: pd.Series) -> pd.Series:
-    if series is None:
-        return pd.Series(dtype=float)
-    return pd.to_numeric(series, errors="coerce")
+def parse_dates(s):
+    return pd.to_datetime(s, errors="coerce")
 
 
-def parse_date(series: pd.Series) -> pd.Series:
-    if series is None:
-        return pd.Series(dtype="datetime64[ns]")
-    return pd.to_datetime(series, errors="coerce")
+def normalize_bill(df: pd.DataFrame, source_name: str) -> pd.DataFrame:
+    col = lambda names: coalesce_col(df, names)
+    mapping = {
+        "place_code": col(["Place Code", "Place"]),
+        "meter_code": col(["Meter Code", "Meter"]),
+        "commodity_code": col(["Commodity Code", "Commodity"]),
+        "account_code": col(["Account Code", "Account Number", "Account"]),
+        "vendor_code": col(["Vendor Code", "Vendor"]),
+        "cost_center_code": col(["C Ctr Code", "Cost Center Code"]),
+        "bill_id": col(["Bill ID"]),
+        "billing_period": col(["Billing Period"]),
+        "rate_schedule": col(["Rate Schedule"]),
+        "start_date": col(["Start Date", "Service Start"]),
+        "end_date": col(["End Date", "Service End"]),
+        "days": col(["Days"]),
+        "native_use": col(["Native Use"]),
+        "demand": col(["Demand"]),
+        "common_use": col(["Common Use"]),
+        "cost": col(["Cost"]),
+        "prior_balance": col(["Prior Balance"]),
+        "late_fee": col(["Late Fee"]),
+        "amount_due": col(["Amount Due (ECBC)", "Amount Due"]),
+        "pay_amount": col(["Pay Amount"]),
+        "ap_status": col(["AP Status"]),
+        "ap_date": col(["APDate", "AP Date"]),
+    }
+    out = pd.DataFrame()
+    for new, old in mapping.items():
+        out[new] = df[old] if old else np.nan
+    out["source_file"] = source_name
+    for c in ["start_date", "end_date", "ap_date"]:
+        out[c] = parse_dates(out[c])
+    for c in ["days", "native_use", "demand", "common_use", "cost", "prior_balance", "late_fee", "amount_due", "pay_amount"]:
+        out[c] = to_num(out[c])
+    out["billing_period"] = out["billing_period"].astype(str).str.replace(".0", "", regex=False)
+    out["ap_status_norm"] = out["ap_status"].fillna("Blank").astype(str).str.strip().replace({"": "Blank"})
+    out["account_key"] = out["account_code"].fillna("").astype(str).str.strip()
+    out["meter_key"] = out["meter_code"].fillna("").astype(str).str.strip()
+    out["vendor_key"] = out["vendor_code"].fillna("").astype(str).str.strip()
+    out["month"] = pd.to_datetime(out["billing_period"].str[:4] + "-" + out["billing_period"].str[4:6] + "-01", errors="coerce")
+    return out
 
 
-def normalize(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
-    mapping = map_columns(list(df.columns))
-    out = pd.DataFrame(index=df.index)
-    for canon in CANONICAL_ALIASES:
-        src = mapping.get(canon)
-        out[canon] = df[src] if src else np.nan
-    out["source_file"] = df.get("source_file", "uploaded_file")
+def normalize_setup(df: pd.DataFrame) -> pd.DataFrame:
+    col = lambda names: coalesce_col(df, names)
+    mapping = {
+        "account_name": col(["Account Name"]),
+        "account_number": col(["Account Number", "Account Code"]),
+        "service_dates": col(["Service Dates"]),
+        "account_status": col(["Status"]),
+        "accruals": col(["Accruals"]),
+        "excluded_from_audits": col(["Excluded From Audits (Y/N)", "Excluded From Audits"]),
+        "account_address": col(["Account Address"]),
+        "account_country": col(["Account Country"]),
+        "payment_type": col(["Payment Type"]),
+        "delivery_method": col(["Delivery Method"]),
+        "bill_frequency": col(["Bill Frequency"]),
+        "cost_center_name": col(["Cost Center Name"]),
+        "cost_center_code": col(["Cost Center Code"]),
+        "vendor_name": col(["Vendor Name"]),
+        "vendor_code": col(["Vendor Code"]),
+        "vendor_country": col(["Vendor Country"]),
+        "rate_schedule": col(["Rate Schedule"]),
+        "meter_name": col(["Meter Name"]),
+        "meter_code": col(["Meter Code"]),
+        "meter_number": col(["Meter Number"]),
+        "commodity": col(["Commodity"]),
+        "site_name": col(["Site Name"]),
+        "site_code": col(["Site Code"]),
+        "site_country": col(["Site Country"]),
+        "division": col(["Division"]),
+        "business_unit": col(["Business Unit"]),
+        "master_vendor_code": col(["Master Vendor Code"]),
+        "master_account_code": col(["Master Account Code"]),
+        "currency_code": col(["Currency Code"]),
+        "export_flag": col(["Export Flag"]),
+    }
+    out = pd.DataFrame()
+    for new, old in mapping.items():
+        out[new] = df[old] if old else np.nan
+    out["account_key"] = out["account_number"].fillna("").astype(str).str.strip()
+    out["meter_key"] = out["meter_code"].fillna("").astype(str).str.strip()
+    out["vendor_key"] = out["vendor_code"].fillna("").astype(str).str.strip()
+    out = out.drop_duplicates(subset=["account_key", "meter_key", "vendor_key"], keep="first")
+    return out
 
-    text_cols = ["place_code", "place_name", "meter_code", "commodity_code", "account_code", "vendor_code", "vendor_name", "bill_id", "billing_period", "rate_schedule", "ap_status"]
-    for c in text_cols:
-        out[c] = out[c].astype(str).replace({"nan": "", "None": ""}).str.strip()
 
-    for c in ["cost", "prior_balance", "late_fee", "amount_due", "pay_amount"]:
-        out[c] = parse_money(out[c])
-    for c in ["days", "native_use", "demand"]:
-        out[c] = parse_num(out[c])
-    for c in ["start_date", "end_date", "ap_date", "due_date", "entry_date"]:
-        out[c] = parse_date(out[c])
+def enrich(bills: pd.DataFrame, setup: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if setup is None or setup.empty:
+        bills["vendor_name"] = bills["vendor_key"]
+        bills["site_name"] = bills["place_code"]
+        bills["site_code"] = bills["place_code"]
+        bills["account_status"] = "Unknown"
+        bills["export_flag"] = "Unknown"
+        bills["payment_type"] = "Unknown"
+        bills["delivery_method"] = "Unknown"
+        bills["bill_frequency"] = "Unknown"
+        return bills
+    # First join on account+meter+vendor. Fallback joins applied afterwards.
+    setup_cols = [c for c in setup.columns if c not in []]
+    m = bills.merge(setup[setup_cols], on=["account_key", "meter_key", "vendor_key"], how="left", suffixes=("", "_setup"))
+    # Fallback by account only for records not matched
+    fallback = setup.drop_duplicates(subset=["account_key"], keep="first")
+    m2 = bills.merge(fallback.add_suffix("_acct"), left_on="account_key", right_on="account_key_acct", how="left")
+    enrich_cols = [c for c in setup.columns if c not in ["account_key", "meter_key", "vendor_key"]]
+    for c in enrich_cols:
+        if c not in m.columns:
+            m[c] = np.nan
+        acct_c = c + "_acct"
+        if acct_c in m2.columns:
+            m[c] = m[c].combine_first(m2[acct_c])
+    m["vendor_name"] = m.get("vendor_name", pd.Series(index=m.index, dtype=object)).fillna(m["vendor_key"])
+    m["site_name"] = m.get("site_name", pd.Series(index=m.index, dtype=object)).fillna(m["place_code"])
+    m["site_code"] = m.get("site_code", pd.Series(index=m.index, dtype=object)).fillna(m["place_code"])
+    for c in ["account_status", "export_flag", "payment_type", "delivery_method", "bill_frequency"]:
+        if c not in m.columns:
+            m[c] = "Unknown"
+        m[c] = m[c].fillna("Unknown")
+    return m
 
-    # Create usable period month.
-    period_str = out["billing_period"].astype(str).str.extract(r"(\d{4})\D?(\d{2})", expand=True)
-    out["period_month"] = pd.to_datetime(period_str[0] + "-" + period_str[1] + "-01", errors="coerce")
-    out.loc[out["period_month"].isna(), "period_month"] = out.loc[out["period_month"].isna(), "end_date"].values.astype("datetime64[M]")
 
-    out["account_key"] = out["vendor_code"].where(out["vendor_code"].ne(""), out["vendor_name"]) + " | " + out["account_code"]
-    out["site_key"] = out["place_code"].where(out["place_code"].ne(""), out["place_name"])
-    out["vendor_key"] = out["vendor_code"].where(out["vendor_code"].ne(""), out["vendor_name"])
-    out["ap_status_norm"] = out["ap_status"].str.lower().str.strip()
-    out["ap_not_exported"] = out["ap_status_norm"].isin(["no", "n", "false", "0", "", "none", "nan"])
-    out["has_prior_balance"] = out["prior_balance"] > 0.01
-    out["has_late_fee"] = out["late_fee"] > 0.01
-    out["balance_gap"] = (out["amount_due"] - out["pay_amount"]).round(2)
-    out["has_payment_shortfall"] = out["balance_gap"] > 0.01
-
+def calculate_risk(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    d = df.copy()
     today = pd.Timestamp.today().normalize()
-    anchor = out["due_date"].fillna(out["end_date"])
-    out["bill_age_days"] = (today - anchor).dt.days
-    out["ap_lag_days"] = (out["ap_date"] - out["end_date"]).dt.days
-    out["entry_to_ap_days"] = (out["ap_date"] - out["entry_date"]).dt.days
+    d["has_prior_balance"] = d["prior_balance"].fillna(0) > 0
+    d["has_late_fee"] = d["late_fee"].fillna(0) > 0
+    d["not_exported_ap"] = d["ap_status_norm"].str.lower().isin(["no", "blank", "nan", "none"])
+    d["ap_lag_days"] = (d["ap_date"] - d["end_date"]).dt.days
+    d["bill_age_days"] = (today - d["end_date"]).dt.days
+    d["unexported_age_days"] = np.where(d["not_exported_ap"], d["bill_age_days"], np.nan)
+    d["inactive_but_billed"] = d["account_status"].astype(str).str.lower().ne("active") & d["account_status"].astype(str).str.lower().ne("unknown")
+    d["no_export_path"] = d["export_flag"].astype(str).str.upper().isin(["NO", "N", "FALSE", "0"])
 
-    # Action/risk scoring at bill row level.
-    out["risk_score"] = 0
-    out.loc[out["has_prior_balance"], "risk_score"] += 30
-    out.loc[out["has_late_fee"], "risk_score"] += 30
-    out.loc[out["ap_not_exported"], "risk_score"] += 20
-    out.loc[out["has_payment_shortfall"], "risk_score"] += 15
-    out.loc[(out["ap_not_exported"]) & (out["bill_age_days"] >= 30), "risk_score"] += 20
-    out.loc[(out["ap_not_exported"]) & (out["bill_age_days"] >= 45), "risk_score"] += 15
-    out["risk_score"] = out["risk_score"].clip(0, 100)
+    # Account-level aggregation
+    group_cols = ["account_key", "vendor_key", "vendor_name", "site_code", "site_name", "commodity_code"]
+    acct = d.groupby(group_cols, dropna=False).agg(
+        bills=("bill_id", "count"),
+        total_cost=("cost", "sum"),
+        latest_bill_end=("end_date", "max"),
+        latest_month=("month", "max"),
+        prior_balance_count=("has_prior_balance", "sum"),
+        prior_balance_total=("prior_balance", "sum"),
+        late_fee_count=("has_late_fee", "sum"),
+        late_fee_total=("late_fee", "sum"),
+        not_exported_count=("not_exported_ap", "sum"),
+        oldest_unexported_age=("unexported_age_days", "max"),
+        avg_ap_lag_days=("ap_lag_days", "mean"),
+        max_ap_lag_days=("ap_lag_days", "max"),
+        inactive_but_billed=("inactive_but_billed", "max"),
+        no_export_path=("no_export_path", "max"),
+    ).reset_index()
 
-    bins = [-1, 24, 49, 74, 100]
-    labels = ["Low", "Medium", "High", "Critical"]
-    out["risk_level"] = pd.cut(out["risk_score"], bins=bins, labels=labels).astype(str)
+    # Consecutive prior balance months
+    tmp = d.dropna(subset=["month"]).sort_values(["account_key", "month"])
+    streaks = []
+    for acc, g in tmp.groupby("account_key"):
+        cur = maxs = 0
+        for val in g.groupby("month")["has_prior_balance"].max().values:
+            if val:
+                cur += 1
+                maxs = max(maxs, cur)
+            else:
+                cur = 0
+        streaks.append((acc, maxs))
+    streak_df = pd.DataFrame(streaks, columns=["account_key", "max_consecutive_prior_balance_months"])
+    acct = acct.merge(streak_df, on="account_key", how="left")
+    acct["max_consecutive_prior_balance_months"] = acct["max_consecutive_prior_balance_months"].fillna(0)
 
-    def action(row):
-        if row["has_prior_balance"] and row["has_late_fee"] and row["ap_not_exported"]:
-            return "Escalate immediately: confirm payment/export and contact utility if needed"
-        if row["has_prior_balance"] and row["ap_not_exported"]:
-            return "Confirm AP export and open balance; prioritize before next bill cycle"
-        if row["has_late_fee"]:
-            return "Review root cause of late fee; verify payment timing and vendor remittance"
-        if row["ap_not_exported"] and row["bill_age_days"] >= 30:
-            return "Investigate why bill has not reached AP; resolve workflow blockage"
-        if row["has_prior_balance"]:
-            return "Validate whether balance is real, disputed, or timing-related"
-        if row["ap_not_exported"]:
-            return "Monitor AP export queue"
-        return "No immediate action"
+    # Risk score
+    acct["risk_score"] = 0
+    acct["risk_score"] += np.where(acct["prior_balance_count"] > 0, 25, 0)
+    acct["risk_score"] += np.where(acct["max_consecutive_prior_balance_months"] >= 2, 20, 0)
+    acct["risk_score"] += np.where(acct["late_fee_count"] > 0, 25, 0)
+    acct["risk_score"] += np.where(acct["not_exported_count"] > 0, 10, 0)
+    acct["risk_score"] += np.where(acct["oldest_unexported_age"].fillna(0) >= 30, 10, 0)
+    acct["risk_score"] += np.where(acct["no_export_path"], 10, 0)
+    acct["risk_score"] += np.where(acct["inactive_but_billed"], 10, 0)
+    acct["risk_score"] = acct["risk_score"].clip(upper=100)
+    acct["risk_level"] = pd.cut(acct["risk_score"], bins=[-1, 24, 49, 74, 100], labels=["Low", "Medium", "High", "Critical"])
 
-    out["recommended_action"] = out.apply(action, axis=1)
-    return out, mapping
+    def recommendation(row):
+        parts = []
+        if row["inactive_but_billed"]:
+            parts.append("Validate account/site status; account is not active but has bill activity")
+        if row["no_export_path"]:
+            parts.append("Verify AP/GL export configuration or alternate payment process")
+        if row["prior_balance_count"] > 0 and row["late_fee_count"] > 0:
+            parts.append("Escalate with AP and utility; prior balance and late fees indicate payment posting risk")
+        elif row["prior_balance_count"] > 0:
+            parts.append("Confirm prior balance root cause and whether recent payments posted at the utility")
+        elif row["late_fee_count"] > 0:
+            parts.append("Review late fee history and tighten payment timing for this account")
+        if row["not_exported_count"] > 0:
+            parts.append("Review unexported bills and confirm they are queued for AP")
+        if not parts:
+            parts.append("Monitor; no major AP risk indicators in uploaded data")
+        return "; ".join(parts)
+
+    acct["recommended_action"] = acct.apply(recommendation, axis=1)
+    acct["priority_rank"] = acct["risk_score"].rank(method="first", ascending=False).astype(int)
+    return d, acct.sort_values(["risk_score", "prior_balance_total", "late_fee_total"], ascending=[False, False, False])
 
 
-def dollars(x):
-    try:
-        return f"${x:,.0f}"
-    except Exception:
-        return "$0"
-
-
-def pct(x):
-    try:
-        return f"{x:.1%}"
-    except Exception:
-        return "0.0%"
-
-
-def export_excel(dfs: Dict[str, pd.DataFrame]) -> bytes:
-    output = BytesIO()
+def xlsx_download(df: pd.DataFrame, sheet_name="Actions") -> bytes:
+    output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        for name, data in dfs.items():
-            safe_name = name[:31]
-            data.to_excel(writer, index=False, sheet_name=safe_name)
-            ws = writer.sheets[safe_name]
-            for idx, col in enumerate(data.columns):
-                width = min(max(len(str(col)) + 2, 12), 42)
-                ws.set_column(idx, idx, width)
+        df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
     return output.getvalue()
 
 
-# -----------------------------
-# UI
-# -----------------------------
+def metric(label, value, help=None):
+    st.metric(label, value, help=help)
 
-st.title("EnergyCAP Late Fee & Service Disconnection Risk Dashboard")
-st.caption("Upload one or more EnergyCAP Bill Transfer Format Excel exports. A 18–24 month export creates the best historical risk view; a current-month export helps identify bills not yet exported to AP.")
+# -------------------------
+# UI
+# -------------------------
+
+st.title("EnergyCAP AP Risk Dashboard")
+st.caption("Late fee, prior-balance, AP export, disconnection-risk, and account-master QA analysis for EnergyCAP exports.")
 
 with st.sidebar:
-    st.header("Upload")
-    files = st.file_uploader("EnergyCAP Excel report(s)", type=["xlsx", "xls"], accept_multiple_files=True)
-    st.header("Risk settings")
-    high_value_threshold = st.number_input("High-value unexported bill threshold", min_value=0, value=10000, step=1000)
-    old_bill_days = st.number_input("Old unexported bill age threshold", min_value=1, value=30, step=1)
-    st.markdown("**Expected useful fields:** AP Status, AP Date, Prior Balance, Late Fee, Amount Due, Pay Amount, Vendor, Account, Site, Commodity, End Date.")
+    st.header("Upload files")
+    bill_files = st.file_uploader(
+        "Bill Transfer export(s)", type=["xlsx"], accept_multiple_files=True,
+        help="Upload one or more Custom ENEL01 Bill Transfer Format Excel exports. 18-24 months is ideal."
+    )
+    setup_file = st.file_uploader(
+        "Optional Report-03 Setup Report", type=["xlsx"], accept_multiple_files=False,
+        help="Adds vendor/site/account status, payment type, delivery method, export flag, GL/account mapping, etc."
+    )
+    st.divider()
+    only_active = st.checkbox("Prioritize active accounts only", value=False)
+    min_score = st.slider("Minimum risk score in action list", 0, 100, 25)
 
-if not files:
-    st.info("Upload the Custom ENEL01 Bill Transfer Format report to begin.")
+if not bill_files:
+    st.info("Upload at least one EnergyCAP Bill Transfer export to begin. Add Report-03 for richer recommendations.")
     st.stop()
 
-frames = []
-errors = []
-for f in files:
-    try:
-        frames.append(read_one_excel(f))
-    except Exception as e:
-        errors.append(f"{f.name}: {e}")
+try:
+    bill_frames = []
+    for f in bill_files:
+        raw = read_energycap_excel(f, "bill")
+        bill_frames.append(normalize_bill(raw, f.name))
+    bills = pd.concat(bill_frames, ignore_index=True)
 
-if errors:
-    st.warning("Some files could not be read:\n" + "\n".join(errors))
+    setup = None
+    if setup_file is not None:
+        setup_raw = read_energycap_excel(setup_file, "setup")
+        setup = normalize_setup(setup_raw)
 
-if not frames:
-    st.error("No usable files were loaded.")
+    data = enrich(bills, setup)
+    data, account_risk = calculate_risk(data)
+except Exception as e:
+    st.error("The app could not parse the uploaded file(s). Confirm they are EnergyCAP Excel exports and not password-protected.")
+    st.exception(e)
     st.stop()
 
-raw_all = pd.concat(frames, ignore_index=True)
-data, mapping = normalize(raw_all)
+if only_active and "account_status" in account_risk.columns:
+    active_keys = data.loc[data["account_status"].astype(str).str.lower().eq("active"), "account_key"].unique()
+    account_risk = account_risk[account_risk["account_key"].isin(active_keys)]
+    data = data[data["account_key"].isin(active_keys)]
 
-# Dynamic recalculation for user threshold.
-data.loc[(data["ap_not_exported"]) & (data["cost"] >= high_value_threshold), "risk_score"] = (data["risk_score"] + 10).clip(0, 100)
-data.loc[(data["ap_not_exported"]) & (data["bill_age_days"] >= old_bill_days), "risk_score"] = (data["risk_score"] + 10).clip(0, 100)
-data["risk_level"] = pd.cut(data["risk_score"], bins=[-1, 24, 49, 74, 100], labels=["Low", "Medium", "High", "Critical"]).astype(str)
-
-valid_account = data["account_code"].ne("")
-filtered = data[valid_account].copy() if valid_account.any() else data.copy()
-
-# Account-level rollup
-acct = filtered.groupby(["account_key", "vendor_key", "site_key", "commodity_code"], dropna=False).agg(
-    bills=("bill_id", "count"),
-    spend=("cost", "sum"),
-    prior_balance_total=("prior_balance", "sum"),
-    prior_balance_bills=("has_prior_balance", "sum"),
-    late_fee_total=("late_fee", "sum"),
-    late_fee_bills=("has_late_fee", "sum"),
-    ap_not_exported_bills=("ap_not_exported", "sum"),
-    max_bill_age_days=("bill_age_days", "max"),
-    avg_ap_lag_days=("ap_lag_days", "mean"),
-    avg_risk_score=("risk_score", "mean"),
-    max_risk_score=("risk_score", "max"),
-).reset_index()
-acct["prior_balance_rate"] = acct["prior_balance_bills"] / acct["bills"].replace(0, np.nan)
-acct["late_fee_rate"] = acct["late_fee_bills"] / acct["bills"].replace(0, np.nan)
-acct["priority_score"] = (
-    acct["max_risk_score"] * 0.50
-    + acct["prior_balance_rate"].fillna(0) * 20
-    + acct["late_fee_rate"].fillna(0) * 20
-    + np.minimum(acct["spend"] / max(high_value_threshold, 1), 3) * 5
-).round(1).clip(0, 100)
-acct["priority"] = pd.cut(acct["priority_score"], bins=[-1, 24, 49, 74, 100], labels=["Monitor", "Medium", "High", "Critical"]).astype(str)
-acct = acct.sort_values(["priority_score", "late_fee_total", "prior_balance_total"], ascending=False)
-
-# Recommended actions table
-recommend = filtered[filtered["risk_score"] >= 25].copy()
-recommend = recommend.sort_values(["risk_score", "prior_balance", "late_fee", "cost"], ascending=False)
-recommend_cols = [
-    "risk_level", "risk_score", "recommended_action", "vendor_key", "account_code", "site_key", "commodity_code",
-    "billing_period", "end_date", "ap_status", "ap_date", "cost", "prior_balance", "late_fee", "amount_due", "pay_amount", "bill_age_days", "source_file"
-]
-recommend = recommend[[c for c in recommend_cols if c in recommend.columns]]
-
-# Tabs
-tabs = st.tabs(["Summary", "AP Processing Analysis", "Prior Balance & Late Fees", "Vendor / Site Risk", "Recommended Actions", "Data Quality"])
+tabs = st.tabs([
+    "Summary", "AP Processing", "Prior Balance & Late Fees", "Vendor / Site Risk", "Account Master QA", "Recommended Actions", "Raw Data"
+])
 
 with tabs[0]:
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Bills loaded", f"{len(filtered):,}")
-    c2.metric("Total spend", dollars(filtered["cost"].sum()))
-    c3.metric("Late fees", dollars(filtered["late_fee"].sum()))
-    c4.metric("Bills not exported to AP", f"{int(filtered['ap_not_exported'].sum()):,}")
-    c5.metric("Accounts with prior balance", f"{acct[acct['prior_balance_bills'] > 0]['account_key'].nunique():,}")
+    c1.metric("Bills", f"{len(data):,}")
+    c2.metric("Spend", f"${data['cost'].fillna(0).sum():,.0f}")
+    c3.metric("Late fees", f"${data['late_fee'].fillna(0).sum():,.0f}")
+    c4.metric("Accounts w/ prior balance", f"{account_risk.loc[account_risk['prior_balance_count']>0,'account_key'].nunique():,}")
+    c5.metric("Critical / High accounts", f"{account_risk[account_risk['risk_level'].isin(['Critical','High'])].shape[0]:,}")
 
     left, right = st.columns([1.2, 1])
     with left:
-        st.subheader("Monthly risk trend")
-        trend = filtered.dropna(subset=["period_month"]).groupby("period_month").agg(
-            late_fee_total=("late_fee", "sum"),
-            prior_balance_total=("prior_balance", "sum"),
-            not_exported=("ap_not_exported", "sum"),
+        st.subheader("Monthly risk indicators")
+        trend = data.dropna(subset=["month"]).groupby("month").agg(
+            spend=("cost", "sum"), prior_balance=("prior_balance", "sum"), late_fee=("late_fee", "sum"), unexported=("not_exported_ap", "sum")
         ).reset_index()
         if not trend.empty:
-            fig = px.line(trend, x="period_month", y=["late_fee_total", "prior_balance_total", "not_exported"], markers=True)
+            fig = px.line(trend, x="month", y=["prior_balance", "late_fee"], markers=True, title="Prior balance and late fees by billing month")
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("No valid billing period/end date available for trend analysis.")
+            st.warning("No valid billing periods were found for trend analysis.")
     with right:
-        st.subheader("Top 10 highest-risk accounts")
-        st.dataframe(acct.head(10), use_container_width=True, hide_index=True)
+        st.subheader("Top risk accounts")
+        st.dataframe(account_risk.head(10)[["risk_level", "risk_score", "account_key", "vendor_name", "site_name", "commodity_code", "recommended_action"]], use_container_width=True, hide_index=True)
 
 with tabs[1]:
-    st.subheader("AP status and export timing")
-    left, right = st.columns(2)
-    status = filtered["ap_status"].replace("", "Blank").value_counts().reset_index()
-    status.columns = ["AP Status", "Bills"]
-    with left:
-        st.plotly_chart(px.bar(status, x="AP Status", y="Bills", text="Bills"), use_container_width=True)
-    with right:
-        lag = filtered.dropna(subset=["ap_lag_days"]).copy()
-        if not lag.empty:
-            lag_vendor = lag.groupby("vendor_key")["ap_lag_days"].mean().sort_values(ascending=False).head(20).reset_index()
-            st.plotly_chart(px.bar(lag_vendor, x="vendor_key", y="ap_lag_days", title="Average AP lag by vendor"), use_container_width=True)
-        else:
-            st.info("AP Date is not populated enough to calculate AP lag.")
-
-    st.subheader("Oldest / highest-value bills not exported to AP")
-    queue = filtered[filtered["ap_not_exported"]].copy()
-    queue = queue.sort_values(["bill_age_days", "cost"], ascending=False)
-    st.dataframe(queue[[c for c in ["vendor_key", "account_code", "site_key", "commodity_code", "billing_period", "end_date", "cost", "ap_status", "bill_age_days", "source_file"] if c in queue.columns]].head(200), use_container_width=True, hide_index=True)
+    st.subheader("AP processing analysis")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Not exported to AP", f"{int(data['not_exported_ap'].sum()):,}")
+    c2.metric("Avg AP lag days", f"{data['ap_lag_days'].dropna().mean():.1f}" if data['ap_lag_days'].notna().any() else "n/a")
+    c3.metric("Oldest unexported bill age", f"{data['unexported_age_days'].dropna().max():.0f} days" if data['unexported_age_days'].notna().any() else "n/a")
+    col1, col2 = st.columns(2)
+    with col1:
+        status = data.groupby("ap_status_norm").size().reset_index(name="bills")
+        st.plotly_chart(px.bar(status, x="ap_status_norm", y="bills", title="AP status breakdown"), use_container_width=True)
+    with col2:
+        vendor_lag = data.groupby("vendor_name").agg(avg_ap_lag=("ap_lag_days", "mean"), bills=("bill_id", "count"), not_exported=("not_exported_ap", "sum")).reset_index().sort_values("not_exported", ascending=False).head(20)
+        st.plotly_chart(px.bar(vendor_lag, x="vendor_name", y="not_exported", title="Unexported bills by vendor"), use_container_width=True)
+    st.subheader("Oldest / highest-value unexported bills")
+    unexp = data[data["not_exported_ap"]].sort_values(["unexported_age_days", "cost"], ascending=[False, False])
+    st.dataframe(unexp[["account_key", "vendor_name", "site_name", "commodity_code", "end_date", "cost", "amount_due", "ap_status_norm", "unexported_age_days", "source_file"]].head(100), use_container_width=True, hide_index=True)
 
 with tabs[2]:
-    st.subheader("Prior balance and late fee patterns")
-    c1, c2 = st.columns(2)
-    vendor_pb = filtered.groupby("vendor_key").agg(prior_balance=("prior_balance", "sum"), late_fees=("late_fee", "sum"), bills=("bill_id", "count")).reset_index().sort_values("prior_balance", ascending=False).head(20)
-    c1.plotly_chart(px.bar(vendor_pb, x="vendor_key", y="prior_balance", title="Prior balance by vendor"), use_container_width=True)
-    c2.plotly_chart(px.bar(vendor_pb.sort_values("late_fees", ascending=False), x="vendor_key", y="late_fees", title="Late fees by vendor"), use_container_width=True)
-
-    st.subheader("Accounts with recurring balances or late fees")
-    recur = acct[(acct["prior_balance_bills"] > 0) | (acct["late_fee_bills"] > 0)].copy()
-    st.dataframe(recur, use_container_width=True, hide_index=True)
+    st.subheader("Prior balance & late fee analysis")
+    col1, col2 = st.columns(2)
+    with col1:
+        pb = account_risk[account_risk["prior_balance_count"] > 0].head(25)
+        st.dataframe(pb[["risk_level", "risk_score", "account_key", "vendor_name", "site_name", "prior_balance_count", "prior_balance_total", "max_consecutive_prior_balance_months", "recommended_action"]], use_container_width=True, hide_index=True)
+    with col2:
+        lf = account_risk[account_risk["late_fee_count"] > 0].sort_values("late_fee_total", ascending=False).head(25)
+        st.dataframe(lf[["risk_level", "risk_score", "account_key", "vendor_name", "site_name", "late_fee_count", "late_fee_total", "recommended_action"]], use_container_width=True, hide_index=True)
+    monthly = data.dropna(subset=["month"]).groupby(["month", "vendor_name"]).agg(prior_balance=("prior_balance", "sum"), late_fee=("late_fee", "sum")).reset_index()
+    if not monthly.empty:
+        st.plotly_chart(px.area(monthly, x="month", y="prior_balance", color="vendor_name", title="Prior balance by vendor over time"), use_container_width=True)
 
 with tabs[3]:
     st.subheader("Vendor / site risk scorecards")
-    group_choice = st.radio("Group scorecard by", ["vendor_key", "site_key", "commodity_code"], horizontal=True)
-    scorecard = filtered.groupby(group_choice).agg(
-        bills=("bill_id", "count"),
-        spend=("cost", "sum"),
-        prior_balance_total=("prior_balance", "sum"),
-        late_fee_total=("late_fee", "sum"),
-        ap_not_exported_bills=("ap_not_exported", "sum"),
-        avg_risk_score=("risk_score", "mean"),
-        max_risk_score=("risk_score", "max"),
-    ).reset_index().sort_values("max_risk_score", ascending=False)
-    st.dataframe(scorecard, use_container_width=True, hide_index=True)
-
-    st.subheader("Risk heatmap by month")
-    heat = filtered.dropna(subset=["period_month"]).groupby([group_choice, "period_month"])["risk_score"].mean().reset_index()
-    top_groups = scorecard[group_choice].head(15).tolist()
-    heat = heat[heat[group_choice].isin(top_groups)]
-    if not heat.empty:
-        fig = px.density_heatmap(heat, x="period_month", y=group_choice, z="risk_score", histfunc="avg")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("Not enough dated records to build a heatmap.")
+    v = account_risk.groupby("vendor_name").agg(accounts=("account_key", "nunique"), avg_risk=("risk_score", "mean"), critical_high=("risk_level", lambda s: s.isin(["Critical", "High"]).sum()), prior_balance=("prior_balance_total", "sum"), late_fees=("late_fee_total", "sum"), unexported=("not_exported_count", "sum")).reset_index().sort_values(["critical_high", "avg_risk"], ascending=False)
+    s = account_risk.groupby("site_name").agg(accounts=("account_key", "nunique"), avg_risk=("risk_score", "mean"), critical_high=("risk_level", lambda x: x.isin(["Critical", "High"]).sum()), prior_balance=("prior_balance_total", "sum"), late_fees=("late_fee_total", "sum"), unexported=("not_exported_count", "sum")).reset_index().sort_values(["critical_high", "avg_risk"], ascending=False)
+    col1, col2 = st.columns(2)
+    with col1:
+        st.dataframe(v.head(30), use_container_width=True, hide_index=True)
+        st.plotly_chart(px.bar(v.head(15), x="vendor_name", y="critical_high", title="Critical/high-risk accounts by vendor"), use_container_width=True)
+    with col2:
+        st.dataframe(s.head(30), use_container_width=True, hide_index=True)
+        st.plotly_chart(px.bar(s.head(15), x="site_name", y="critical_high", title="Critical/high-risk accounts by site"), use_container_width=True)
 
 with tabs[4]:
-    st.subheader("Prioritized action register")
-    st.caption("Use this tab as the operational work queue for AP, utility vendor management, and account owners.")
-    risk_filter = st.multiselect("Risk levels", ["Critical", "High", "Medium", "Low"], default=["Critical", "High", "Medium"])
-    rec_view = recommend[recommend["risk_level"].isin(risk_filter)] if risk_filter else recommend
-    st.dataframe(rec_view, use_container_width=True, hide_index=True)
-
-    export_bytes = export_excel({"Recommended Actions": rec_view, "Account Rollup": acct, "Normalized Data": filtered})
-    st.download_button("Download action register", data=export_bytes, file_name="energycap_ap_risk_action_register.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.subheader("Account master QA")
+    if setup is None:
+        st.info("Upload Report-03 to enable account master QA checks.")
+    else:
+        qa = data.copy()
+        qa["missing_vendor_name"] = qa["vendor_name"].isna() | qa["vendor_name"].astype(str).str.lower().isin(["", "nan", "unknown"])
+        qa["missing_site"] = qa["site_name"].isna() | qa["site_name"].astype(str).str.lower().isin(["", "nan", "unknown"])
+        qa["missing_export_flag"] = qa["export_flag"].isna() | qa["export_flag"].astype(str).str.lower().isin(["", "nan", "unknown"])
+        qa_acct = qa.groupby(["account_key", "vendor_name", "site_name", "commodity_code"], dropna=False).agg(
+            bills=("bill_id", "count"), inactive_but_billed=("inactive_but_billed", "max"), no_export_path=("no_export_path", "max"), missing_export_flag=("missing_export_flag", "max"), payment_type=("payment_type", "first"), delivery_method=("delivery_method", "first"), bill_frequency=("bill_frequency", "first"), export_flag=("export_flag", "first"), account_status=("account_status", "first")
+        ).reset_index()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Inactive but billed", f"{qa_acct['inactive_but_billed'].sum():,}")
+        c2.metric("No AP/GL export path", f"{qa_acct['no_export_path'].sum():,}")
+        c3.metric("Missing/unknown export flag", f"{qa_acct['missing_export_flag'].sum():,}")
+        st.dataframe(qa_acct[(qa_acct["inactive_but_billed"] | qa_acct["no_export_path"] | qa_acct["missing_export_flag"])].head(200), use_container_width=True, hide_index=True)
 
 with tabs[5]:
-    st.subheader("Column mapping detected")
-    mapping_df = pd.DataFrame([{"Canonical field": k, "Source column": v} for k, v in mapping.items()])
-    st.dataframe(mapping_df, use_container_width=True, hide_index=True)
+    st.subheader("Recommended / prioritized actions")
+    actions = account_risk[account_risk["risk_score"] >= min_score].copy()
+    actions = actions.sort_values(["risk_score", "prior_balance_total", "late_fee_total", "not_exported_count"], ascending=False)
+    display_cols = ["risk_level", "risk_score", "priority_rank", "account_key", "vendor_name", "site_name", "commodity_code", "bills", "prior_balance_count", "prior_balance_total", "late_fee_count", "late_fee_total", "not_exported_count", "oldest_unexported_age", "max_consecutive_prior_balance_months", "recommended_action"]
+    st.dataframe(actions[display_cols], use_container_width=True, hide_index=True)
+    st.download_button("Download action register (Excel)", data=xlsx_download(actions[display_cols + [c for c in actions.columns if c not in display_cols]]), file_name="energycap_ap_risk_action_register.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    expected = ["account_code", "vendor_code", "billing_period", "end_date", "cost", "prior_balance", "late_fee", "amount_due", "pay_amount", "ap_status", "ap_date"]
-    missing = [c for c in expected if c not in mapping]
-    if missing:
-        st.warning("Missing or undetected useful columns: " + ", ".join(missing))
-    else:
-        st.success("Core AP/bill-pay risk columns were detected.")
-
-    st.subheader("Raw normalized preview")
-    st.dataframe(filtered.head(200), use_container_width=True, hide_index=True)
+with tabs[6]:
+    st.subheader("Normalized bill data")
+    st.dataframe(data, use_container_width=True, hide_index=True)
+    st.download_button("Download normalized data (CSV)", data=data.to_csv(index=False).encode("utf-8"), file_name="normalized_energycap_bill_data.csv", mime="text/csv")
