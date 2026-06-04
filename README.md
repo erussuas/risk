@@ -33,3 +33,7 @@ streamlit run app.py
 - The app uses flexible header detection, so it should handle EnergyCAP exports with several blank rows before the header.
 - The risk model is designed as an operational prioritization tool, not a definitive statement that service will be disconnected.
 - Best results require a long enough bill history to detect recurring prior balances and repeated late fees.
+
+## Scope rule
+
+The app is scoped to **United States and Canada accounts only**, because those are the accounts relevant to the client AP file. When Report-03 is uploaded, records outside the US/Canada scope are excluded from KPIs, charts, scoring, QA tables, and recommended actions. The app uses Site Country first, then Account Country, then Vendor Country to determine scope. If no Report-03/country data is provided, the app keeps uploaded records but warns that country scope could not be verified.

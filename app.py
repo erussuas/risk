@@ -81,6 +81,40 @@ def parse_dates(s):
     return pd.to_datetime(s, errors="coerce")
 
 
+def normalize_country_value(x: object) -> str:
+    if pd.isna(x):
+        return ""
+    s = str(x).strip().upper()
+    s = " ".join(s.replace(".", "").replace("-", " ").split())
+    aliases = {
+        "US": "US", "USA": "US", "U S A": "US", "UNITED STATES": "US",
+        "UNITED STATES OF AMERICA": "US", "AMERICA": "US",
+        "CA": "CA", "CAN": "CA", "CANADA": "CA"
+    }
+    return aliases.get(s, s)
+
+
+def add_north_america_scope(df: pd.DataFrame) -> pd.DataFrame:
+    """Flag records that are in AP-relevant US/Canada scope.
+
+    Priority: site country, then account country, then vendor country. If no country
+    fields are available at all, keep records in scope so the app remains usable with
+    Bill Transfer-only uploads and explain this in the UI.
+    """
+    d = df.copy()
+    for c in ["site_country", "account_country", "vendor_country"]:
+        if c not in d.columns:
+            d[c] = np.nan
+    d["scope_country_raw"] = d["site_country"].combine_first(d["account_country"]).combine_first(d["vendor_country"])
+    d["scope_country"] = d["scope_country_raw"].apply(normalize_country_value)
+    has_any_country = d["scope_country"].astype(str).str.len().gt(0).any()
+    if has_any_country:
+        d["in_ap_scope"] = d["scope_country"].isin(["US", "CA"])
+    else:
+        d["in_ap_scope"] = True
+    return d
+
+
 def normalize_bill(df: pd.DataFrame, source_name: str) -> pd.DataFrame:
     col = lambda names: coalesce_col(df, names)
     mapping = {
@@ -215,7 +249,7 @@ def calculate_risk(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     d["no_export_path"] = d["export_flag"].astype(str).str.upper().isin(["NO", "N", "FALSE", "0"])
 
     # Account-level aggregation
-    group_cols = ["account_key", "vendor_key", "vendor_name", "site_code", "site_name", "commodity_code"]
+    group_cols = ["account_key", "vendor_key", "vendor_name", "site_code", "site_name", "commodity_code", "scope_country"]
     acct = d.groupby(group_cols, dropna=False).agg(
         bills=("bill_id", "count"),
         total_cost=("cost", "sum"),
@@ -299,7 +333,7 @@ def metric(label, value, help=None):
 # -------------------------
 
 st.title("EnergyCAP AP Risk Dashboard")
-st.caption("Late fee, prior-balance, AP export, disconnection-risk, and account-master QA analysis for EnergyCAP exports.")
+st.caption("Late fee, prior-balance, AP export, disconnection-risk, and account-master QA analysis for US and Canada EnergyCAP AP exports.")
 
 with st.sidebar:
     st.header("Upload files")
@@ -314,6 +348,8 @@ with st.sidebar:
     st.divider()
     only_active = st.checkbox("Prioritize active accounts only", value=False)
     min_score = st.slider("Minimum risk score in action list", 0, 100, 25)
+    st.divider()
+    st.caption("Scope: US and Canada accounts only. Other countries are excluded from KPIs, charts, scoring, and recommendations when country data is available.")
 
 if not bill_files:
     st.info("Upload at least one EnergyCAP Bill Transfer export to begin. Add Report-03 for richer recommendations.")
@@ -332,11 +368,24 @@ try:
         setup = normalize_setup(setup_raw)
 
     data = enrich(bills, setup)
+    data = add_north_america_scope(data)
+    pre_scope_count = len(data)
+    out_of_scope_count = int((~data["in_ap_scope"]).sum())
+    data = data[data["in_ap_scope"]].copy()
     data, account_risk = calculate_risk(data)
 except Exception as e:
     st.error("The app could not parse the uploaded file(s). Confirm they are EnergyCAP Excel exports and not password-protected.")
     st.exception(e)
     st.stop()
+
+if data.empty:
+    st.warning("No US or Canada records were found after applying the AP scope filter. Check the country fields in Report-03 or upload a scoped extract.")
+    st.stop()
+
+if out_of_scope_count > 0:
+    st.info(f"US/Canada AP scope applied: excluded {out_of_scope_count:,} non-US/Canada bill record(s) from analysis.")
+elif setup is None:
+    st.warning("No Report-03 setup file was uploaded, so the app could not verify country scope. Upload Report-03 to strictly filter to US and Canada accounts.")
 
 if only_active and "account_status" in account_risk.columns:
     active_keys = data.loc[data["account_status"].astype(str).str.lower().eq("active"), "account_key"].unique()
@@ -348,12 +397,13 @@ tabs = st.tabs([
 ])
 
 with tabs[0]:
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Bills", f"{len(data):,}")
-    c2.metric("Spend", f"${data['cost'].fillna(0).sum():,.0f}")
-    c3.metric("Late fees", f"${data['late_fee'].fillna(0).sum():,.0f}")
-    c4.metric("Accounts w/ prior balance", f"{account_risk.loc[account_risk['prior_balance_count']>0,'account_key'].nunique():,}")
-    c5.metric("Critical / High accounts", f"{account_risk[account_risk['risk_level'].isin(['Critical','High'])].shape[0]:,}")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("US/Canada bills", f"{len(data):,}")
+    c2.metric("Excluded non-US/Canada", f"{out_of_scope_count:,}")
+    c3.metric("Spend", f"${data['cost'].fillna(0).sum():,.0f}")
+    c4.metric("Late fees", f"${data['late_fee'].fillna(0).sum():,.0f}")
+    c5.metric("Accounts w/ prior balance", f"{account_risk.loc[account_risk['prior_balance_count']>0,'account_key'].nunique():,}")
+    c6.metric("Critical / High accounts", f"{account_risk[account_risk['risk_level'].isin(['Critical','High'])].shape[0]:,}")
 
     left, right = st.columns([1.2, 1])
     with left:
@@ -434,7 +484,7 @@ with tabs[5]:
     st.subheader("Recommended / prioritized actions")
     actions = account_risk[account_risk["risk_score"] >= min_score].copy()
     actions = actions.sort_values(["risk_score", "prior_balance_total", "late_fee_total", "not_exported_count"], ascending=False)
-    display_cols = ["risk_level", "risk_score", "priority_rank", "account_key", "vendor_name", "site_name", "commodity_code", "bills", "prior_balance_count", "prior_balance_total", "late_fee_count", "late_fee_total", "not_exported_count", "oldest_unexported_age", "max_consecutive_prior_balance_months", "recommended_action"]
+    display_cols = ["risk_level", "risk_score", "priority_rank", "account_key", "vendor_name", "site_name", "commodity_code", "scope_country", "bills", "prior_balance_count", "prior_balance_total", "late_fee_count", "late_fee_total", "not_exported_count", "oldest_unexported_age", "max_consecutive_prior_balance_months", "recommended_action"]
     st.dataframe(actions[display_cols], use_container_width=True, hide_index=True)
     st.download_button("Download action register (Excel)", data=xlsx_download(actions[display_cols + [c for c in actions.columns if c not in display_cols]]), file_name="energycap_ap_risk_action_register.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
